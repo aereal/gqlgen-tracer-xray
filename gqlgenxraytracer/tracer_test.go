@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/99designs/gqlgen/graphql"
-	"github.com/99designs/gqlgen/handler"
+	"github.com/99designs/gqlgen/graphql/handler"
+	"github.com/99designs/gqlgen/graphql/handler/transport"
 	"github.com/aereal/gqlgen-tracer-xray/testdata"
 	"github.com/aws/aws-xray-sdk-go/xray"
 )
@@ -17,10 +17,11 @@ import (
 func TestTracer(t *testing.T) {
 	xray.Configure(xray.Config{
 		ContextMissingStrategy: nopMissingStrategy(0),
+		LogLevel:               "trace",
 	})
 	specs := []struct {
 		Name             string
-		Tracer           graphql.Tracer
+		Tracer           tracer
 		ExpectedSegments []*xray.Segment
 		Body             string
 	}{
@@ -89,16 +90,23 @@ func TestTracer(t *testing.T) {
 	}
 	for _, spec := range specs {
 		t.Run(spec.Name, func(t *testing.T) {
-			h := handler.GraphQL(testdata.NewExecutableSchema(testdata.Config{
+			es := testdata.NewExecutableSchema(testdata.Config{
 				Resolvers: &testdata.Resolver{},
-			}), handler.Tracer(spec.Tracer))
+			})
+			srv := handler.New(es)
+			srv.AddTransport(transport.POST{})
+			srv.Use(spec.Tracer)
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			ctx, seg := xray.BeginSegment(ctx, "test")
-			defer seg.Close(nil)
+			defer func() {
+				if seg.InProgress {
+					seg.Close(nil)
+				}
+			}()
 
-			resp := doRequest(ctx, h, http.MethodPost, "/graphql", spec.Body)
+			resp := doRequest(ctx, srv, http.MethodPost, "/graphql", spec.Body)
 			seg.Close(nil)
 			if resp.Code != 200 {
 				t.Error("request failed")
@@ -106,6 +114,11 @@ func TestTracer(t *testing.T) {
 			}
 
 			gotSeg := xray.GetSegment(ctx)
+			if gotSeg == nil {
+				t.Errorf("no segment found")
+				return
+			}
+			t.Logf("segment = %#v", gotSeg)
 			subSegs := drainSegments(gotSeg)
 			if len(subSegs) != len(spec.ExpectedSegments) {
 				t.Errorf("expected %d sub-segments but got %d", len(spec.ExpectedSegments), len(subSegs))
